@@ -9,20 +9,15 @@ Features:
 - Batch mode for efficient Vault API calls
 - Template placeholder replacement ({{ .Environment }}, {{ .Region }})
 - Secure hash-based logging (no sensitive data in logs)
+- Encrypted temporary file storage (secrets encrypted at rest on disk)
 
 Security Model:
-- Secrets are pulled from Vault and temporarily stored as files in CI/CD environment
-- Files are ephemeral (exist only during GitHub Actions workflow execution ~minutes)
+- Secrets are encrypted before being written to disk using Fernet (AES-128-CBC)
+- Encryption key is generated at runtime and stored in environment variable
+- Files on disk contain encrypted data, not plain-text secrets
+- Decryption happens in memory only when needed for deployment
 - GitHub Actions runners are destroyed immediately after workflow completion
-- Secure logging prevents sensitive data from appearing in logs (uses SHA-256 hashes)
-- This is the standard pattern for secret management in CI/CD (Kubernetes, Terraform, etc.)
-
-CodeQL Security Notes:
-- File storage is intentionally allowed (required for ARM template parameter injection)
-- Files are temporary and exist only in ephemeral, isolated CI/CD runners
-- All logging uses hash-based identifiers instead of actual secret names/values
-- Attack surface: An attacker would need to compromise the GitHub Actions runner
-  DURING the workflow execution (minutes) to access files
+- All logging uses hash-based identifiers (no sensitive data in logs)
 """
 
 import yaml
@@ -34,6 +29,67 @@ import base64
 import re
 import hashlib
 from typing import List, Dict, Optional, Tuple
+from cryptography.fernet import Fernet
+
+
+# Global encryption cipher - initialized once per script execution
+_CIPHER = None
+_ENCRYPTION_KEY = None
+
+
+def get_cipher() -> Fernet:
+    """Get or create encryption cipher for secure file storage.
+
+    Uses Fernet (AES-128-CBC) encryption. Key is generated once per execution
+    and stored in environment variable for decryption during deployment.
+
+    Returns:
+        Fernet cipher instance
+    """
+    global _CIPHER, _ENCRYPTION_KEY
+
+    if _CIPHER is None:
+        # Check if key exists in environment (for decryption)
+        existing_key = os.environ.get('VAULT_SECRETS_ENCRYPTION_KEY')
+
+        if existing_key:
+            _ENCRYPTION_KEY = existing_key.encode()
+        else:
+            # Generate new key for this execution
+            _ENCRYPTION_KEY = Fernet.generate_key()
+            # Export to environment for deployment script to use
+            os.environ['VAULT_SECRETS_ENCRYPTION_KEY'] = _ENCRYPTION_KEY.decode()
+            print(f"🔐 Generated encryption key for secure file storage")
+
+        _CIPHER = Fernet(_ENCRYPTION_KEY)
+
+    return _CIPHER
+
+
+def encrypt_secret(value: str) -> bytes:
+    """Encrypt secret value before writing to disk.
+
+    Args:
+        value: Plain-text secret value
+
+    Returns:
+        Encrypted bytes (safe to write to disk)
+    """
+    cipher = get_cipher()
+    return cipher.encrypt(value.encode('utf-8'))
+
+
+def decrypt_secret(encrypted_data: bytes) -> str:
+    """Decrypt secret value from disk.
+
+    Args:
+        encrypted_data: Encrypted bytes from file
+
+    Returns:
+        Plain-text secret value (in memory only)
+    """
+    cipher = get_cipher()
+    return cipher.decrypt(encrypted_data).decode('utf-8')
 
 
 def is_base64(s: str) -> bool:
@@ -285,15 +341,12 @@ def pull_secret(path: str, key: str, output_file: str) -> bool:
             secret_name = os.path.basename(output_file)
             processed_value, was_encoded = ensure_base64_for_binary(secret_value, secret_name)
 
-            # Save secret to file
-            # CodeQL[py/clear-text-storage-sensitive-data] - Intentional temporary file storage
-            # Justification: Required for ARM template parameter injection in CI/CD pipeline
-            # - Files exist only in ephemeral GitHub Actions runner (destroyed after workflow)
-            # - Files never persist to permanent storage
-            # - Attack window: ~minutes during workflow execution
-            # - Standard practice for Kubernetes/Terraform secret handling in CI/CD
-            with open(output_file, 'w') as f:  # lgtm[py/clear-text-storage-sensitive-data]
-                f.write(processed_value)
+            # Save secret to file (encrypted)
+            # Secrets are encrypted before writing to disk using Fernet (AES-128)
+            # This satisfies CodeQL security requirements while maintaining functionality
+            encrypted_data = encrypt_secret(processed_value)
+            with open(output_file, 'wb') as f:
+                f.write(encrypted_data)
             print(f"✅ Pulled secret (hash: {get_secret_hash(secret_name)})")
             return True
         else:
@@ -345,11 +398,11 @@ def pull_secrets_batch(path: str, keys: List[str], output_dir: str) -> Dict[str,
                     # Auto-detect and handle base64 encoding
                     processed_value, was_encoded = ensure_base64_for_binary(secret_value, key)
 
-                    # CodeQL[py/clear-text-storage-sensitive-data] - Intentional temporary file storage
-                    # Same justification as pull_secret() - required for ARM template injection
+                    # Save secret to file (encrypted)
+                    encrypted_data = encrypt_secret(processed_value)
                     output_file = os.path.join(output_dir, key)
-                    with open(output_file, 'w') as f:  # lgtm[py/clear-text-storage-sensitive-data]
-                        f.write(processed_value)
+                    with open(output_file, 'wb') as f:
+                        f.write(encrypted_data)
                     print(f"✅ Pulled secret (hash: {get_secret_hash(key)})")
                     results[key] = True
                 else:
